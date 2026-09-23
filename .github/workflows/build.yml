@@ -1,278 +1,161 @@
-name: Build Flutter APK
+name: Flutter APK Builder
 
 on:
   workflow_dispatch:
     inputs:
-      zip_url:
-        description: "URL download ZIP project Flutter"
-        required: true
-        type: string
-
       tag:
-        description: "Tag build"
+        description: "Release tag containing source ZIP"
         required: true
         type: string
-
       build_type:
-        description: "debug / release"
+        description: "APK build type"
         required: true
         type: choice
         options:
-          - debug
           - release
-        default: "release"
-        
-      only_analyze:
-        description: "Hanya jalankan analyze (true/false)"
-        required: false
-        type: boolean
-        default: false
+          - debug
+        default: release
 
-env:
-  FLUTTER_VERSION: "3.41.9"
-  JAVA_VERSION: "17"
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-build-${{ github.repository }}-${{ inputs.tag }}-${{ inputs.build_type }}
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Flutter ${{ inputs.build_type }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    
-    steps:
+    timeout-minutes: 45
 
-      # =========================
-      # ✅ CHECKOUT REPOSITORY (PENTING!)
-      # =========================
-      - name: "📥 Checkout Repository"
+    env:
+      BUILD_TYPE: ${{ inputs.build_type }}
+      SOURCE_DIR: ${{ github.workspace }}/source
+      LOG_DIR: ${{ github.workspace }}/build_logs
+
+    steps:
+      - name: Checkout builder repository
         uses: actions/checkout@v4
 
-      # =========================
-      # DOWNLOAD ZIP
-      # =========================
-      - name: "📥 Download ZIP project"
+      - name: Prepare environment
+        shell: bash
         run: |
-          echo "=== Downloading ZIP ==="
-          echo "URL: ${{ github.event.inputs.zip_url }}"
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip gh
+          mkdir -p "$SOURCE_DIR" "$LOG_DIR"
 
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o project.zip \
-            --progress-bar \
-            -w "\n=== HTTP Status: %{http_code} ===\n"
-
-          # Check if download success
-          if [ ! -f "project.zip" ]; then
-            echo "❌ ZIP download failed"
-            exit 1
-          fi
-
-          echo ""
-          echo "=== File Info ==="
-          ls -lh project.zip
-
-          echo ""
-          echo "=== File Type ==="
-          file project.zip
-
-      # =========================
-      # EXTRACT ZIP
-      # =========================
-      - name: "📦 Extract ZIP"
+      - name: Download source ZIP
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "=== Validating ZIP ==="
+          set -euxo pipefail
+          cd "$SOURCE_DIR"
+          gh release download "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.zip" \
+            --clobber
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' | head -n 1)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: ZIP tidak ditemukan!"
+            exit 1
+          fi
+          echo "Extracting: $ZIP_FILE"
+          unzip -o "$ZIP_FILE"
+          rm -f "$ZIP_FILE"
+          echo "✅ ZIP Extracted!"
 
-          if ! unzip -t project.zip > /dev/null 2>&1; then
-            echo "❌ File bukan ZIP valid!"
-            echo ""
-            echo "=== Isi file (first 100 bytes) ==="
-            head -c 100 project.zip | od -c
+      # ✅ CARI PUBSPEC — TANPA PIPE, PASTI JALAN WALAU ADA FOLDER TAMBAHAN! ✅
+      - name: Detect Flutter project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "🔍 Mencari pubspec.yaml..."
+          
+          mapfile -t PUBSPEC_LIST < <(find "$SOURCE_DIR" -type f -name "pubspec.yaml" \
+            -not -path "*/build/*" -not -path "*/.git/*" -not -path "*/.pub/*")
+          
+          PUBSPEC="${PUBSPEC_LIST[0]:-}"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "❌ ERROR: pubspec.yaml TIDAK DITEMUKAN!"
+            echo "📂 Isi folder SOURCE_DIR:"
+            ls -la "$SOURCE_DIR"
+            echo "📂 Daftar folder:"
+            find "$SOURCE_DIR" -maxdepth 2 -type d | head -n 20
             exit 1
           fi
 
-          echo "✅ ZIP valid"
+          PROJECT_ROOT="$(cd "$(dirname "$PUBSPEC")" && pwd)"
+          echo "✅ Project ditemukan di: $PROJECT_ROOT"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
 
-          echo ""
-          echo "=== Extracting ZIP ==="
-          unzip -q project.zip -d project_raw
-
-          echo ""
-          echo "=== Isi folder project_raw ==="
-          find project_raw -type f | head -20
-
-          echo ""
-          echo "=== Detecting Project Directory ==="
-          
-          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
-          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
-          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
-            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          else
-            PROJECT_DIR="project_raw"
-          fi
-
-          echo "✅ Project root: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-
-          # Verify pubspec.yaml exists
-          if [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
-            echo "❌ pubspec.yaml tidak ditemukan di $PROJECT_DIR"
-            exit 1
-          fi
-
-          echo "✅ pubspec.yaml found"
-
-      # =========================
-      # JAVA
-      # =========================
-      - name: "☕ Setup Java"
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: ${{ env.JAVA_VERSION }}
-          cache: gradle
+          distribution: temurin
+          java-version: "17"
 
-      # =========================
-      # FLUTTER
-      # =========================
-      - name: "🐦 Setup Flutter"
-        uses: subosito/flutter-action@main
+      # ✅ Flutter 3.32.8 — Dart 3.8.1, kompatibel dengan Gradle 8.12 project ini ✅
+      - name: Setup Flutter — Stable Release
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: "stable"
+          flutter-version: '3.32.8'
+          channel: stable
           cache: true
 
-      # =========================
-      # FLUTTER DOCTOR
-      # =========================
-      - name: "🔧 Flutter Doctor"
-        run: flutter doctor -v
-
-      # ==========================================================
-      # 🔍 TAHAP ANALYZE
-      # ==========================================================
-      - name: "🔍 Analyze Project Code"
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Flutter environment check
         run: |
-          echo "=== Starting Code Analysis ==="
+          flutter --version
+          dart --version
+          flutter doctor -v
 
-          if [ -f "pubspec.yaml" ]; then
-            echo "✅ Flutter project detected"
-            flutter analyze --no-fatal-infos 2>&1 | tee analyze_report.txt || true
-
-            echo ""
-            echo "=== Analysis Results ==="
-            cat analyze_report.txt
-
-          else
-            echo "❌ pubspec.yaml not found - skipping analysis"
-            exit 1
-          fi
-
-      # ==========================================================
-      # 🔍 STOP IF ANALYZE ONLY
-      # ==========================================================
-      - name: "⏹️ Stop if Analyze Only"
-        if: ${{ github.event.inputs.only_analyze == true }}
+      - name: Flutter clean & pub get
+        shell: bash
         run: |
-          echo "✅ Analyze-only mode. Workflow completed."
-          exit 0
+          set -euo pipefail
+          cd "${{ steps.project.outputs.project_root }}"
+          flutter clean
+          flutter pub get
 
-      # ==========================================================
-      # 📦 GET DEPENDENCIES
-      # ==========================================================
-      - name: "📋 Get dependencies"
-        if: ${{ github.event.inputs.only_analyze != true }}
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Fix Gradle Compatibility
+        shell: bash
         run: |
-          echo "=== Getting dependencies ==="
-          
-          if [ -f "pubspec.yaml" ]; then
-            echo "Running flutter pub get..."
-            timeout 180s flutter pub get || {
-              echo "⚠️ First attempt failed, retrying..."
-              timeout 180s flutter pub get --offline || echo "⚠️ Pub get timeout, continuing..."
-            }
-            echo "✅ Dependencies ready"
-          else
-            echo "❌ pubspec.yaml not found"
-            exit 1
-          fi
+          cd "${{ steps.project.outputs.project_root }}/android"
+          echo "android.newDsl=false" >> gradle.properties
+          echo "org.gradle.jvmargs=-Xmx4G" >> gradle.properties
 
-      # ==========================================================
-      # 🚀 BUILD APK
-      # ==========================================================
-      - name: "🚀 Build APK"
-        if: ${{ github.event.inputs.only_analyze != true }}
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Build APK
+        shell: bash
         run: |
-          echo "=== Building APK ==="
-          echo "Build Type: ${{ github.event.inputs.build_type }}"
+          set -o pipefail
+          cd "${{ steps.project.outputs.project_root }}"
+          flutter build apk --${{ inputs.build_type }} --verbose
 
-          if [ -f "pubspec.yaml" ]; then
-            echo "🔥 Flutter Project - Building..."
-            
-            flutter build apk --${{ github.event.inputs.build_type }} \
-              --no-tree-shake-icons \
-              --verbose
-
-            echo "✅ Build completed"
-            
-          else
-            echo "❌ pubspec.yaml not found"
-            exit 1
-          fi
-
-      # =========================
-      # CHECK APK OUTPUT
-      # =========================
-      - name: "✅ Verify APK Output"
-        if: ${{ github.event.inputs.only_analyze != true }}
+      - name: Package APK
+        if: success()
+        shell: bash
         run: |
-          echo "=== Scanning for APK ==="
+          mkdir -p "$GITHUB_WORKSPACE/apk_output"
+          find "${{ steps.project.outputs.project_root }}/build/app/outputs/flutter-apk" -name "*.apk" -exec cp {} "$GITHUB_WORKSPACE/apk_output/" \;
+          ls -lh "$GITHUB_WORKSPACE/apk_output"
 
-          APK_FOUND=$(find ${{ env.PROJECT_DIR }}/build -name "*.apk" -type f | head -n 1)
-
-          if [ -z "$APK_FOUND" ]; then
-            echo "❌ APK not found!"
-            echo ""
-            echo "=== Build directory contents ==="
-            find ${{ env.PROJECT_DIR }}/build -type f -name "*.apk" || echo "No APK files found"
-            exit 1
-          fi
-
-          echo "✅ APK found: $APK_FOUND"
-          echo "APK_PATH=$APK_FOUND" >> $GITHUB_ENV
-
-          echo ""
-          echo "=== APK Details ==="
-          ls -lh "$APK_FOUND"
-          file "$APK_FOUND"
-
-      # =========================
-      # UPLOAD APK
-      # =========================
-      - name: "📤 Upload APK artifact"
-        if: ${{ github.event.inputs.only_analyze != true }}
+      - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
-          path: ${{ env.APK_PATH }}
-          retention-days: 7
+          name: app-${{ inputs.build_type }}
+          path: ${{ github.workspace }}/apk_output/*.apk
           if-no-files-found: error
 
-      # =========================
-      # SUCCESS
-      # =========================
-      - name: "🎉 Build Success"
-        if: success() && github.event.inputs.only_analyze != true
-        run: |
-          echo "╔════════════════════════════════╗"
-          echo "║   ✅ BUILD COMPLETED! ✅       ║"
-          echo "╠════════════════════════════════╣"
-          echo "║ Tag: ${{ github.event.inputs.tag }}"
-          echo "║ Type: ${{ github.event.inputs.build_type }}"
-          echo "║ APK: ${{ env.APK_PATH }}"
-          echo "╚════════════════════════════════╝"
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.build_type }}
+          path: ${{ github.workspace }}/build_logs/**
+          if-no-files-found: warn
           

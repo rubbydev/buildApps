@@ -1,5 +1,7 @@
 name: Build Flutter APK
 
+run-name: Build ${{ github.event.inputs.tag }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -46,7 +48,7 @@ jobs:
           echo "=== Downloading ZIP ==="
           echo "URL: ${{ github.event.inputs.zip_url }}"
 
-          curl -L \
+          curl --fail-with-body -L \
             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             "${{ github.event.inputs.zip_url }}" \
@@ -56,6 +58,14 @@ jobs:
           echo ""
           echo "=== File Info ==="
           ls -lh project.zip
+
+          MAX_SIZE_BYTES=2000000000
+          SIZE_BYTES=$(stat -c%s project.zip)
+          if [ "$SIZE_BYTES" -gt "$MAX_SIZE_BYTES" ]; then
+            echo "❌ ZIP terlalu besar. Maksimal 2 GB (2,000,000,000 bytes)."
+            exit 1
+          fi
+          echo "✅ Ukuran ZIP berada dalam batas 2 GB: $SIZE_BYTES bytes"
 
           echo ""
           echo "=== File Type ==="
@@ -118,7 +128,7 @@ jobs:
       # FLUTTER
       # =========================
       - name: Setup Flutter
-        uses: subosito/flutter-action@main
+        uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.41.9"
           channel: "stable"
@@ -177,7 +187,7 @@ jobs:
         run: |
           echo "=== Running flutter pub get ==="
           if [ -f "pubspec.yaml" ]; then
-            timeout 120s flutter pub get || echo "⚠️ Gagal download package karena network server, coba lanjut aja..."
+            timeout 180s flutter pub get
           else
             echo "☕ Bukan project Flutter standar, skip pub get!"
           fi
@@ -191,6 +201,11 @@ jobs:
         run: |
           echo "=== Building APK ==="
           echo "Mode: ${{ github.event.inputs.build_type }}"
+
+          case "${{ github.event.inputs.build_type }}" in
+            debug|release) ;;
+            *) echo "❌ build_type tidak valid"; exit 1 ;;
+          esac
 
           if [ -f "pubspec.yaml" ]; then
             echo "🔥 Project Flutter Terdeteksi! Kompilasi via Flutter SDK..."
@@ -230,7 +245,7 @@ jobs:
           echo "Mencari file APK di seluruh direktori..."
           find $GITHUB_WORKSPACE -name "*.apk"
 
-          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" | head -n 1)
+          APK_FOUND=$(find "$GITHUB_WORKSPACE" -type f -name "*.apk" | sort | head -n 1)
 
           if [ -z "$APK_FOUND" ]; then
             echo "Error: Berkas biner APK beneran gak dicetak sama sekali oleh compiler."
